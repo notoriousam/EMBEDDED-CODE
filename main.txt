@@ -1,0 +1,823 @@
+/**
+ * @file        main.c
+ * @brief       I2S Receiver with FFT-based Frequency Analysis and Hearing Health Assessment
+ * @details     Research-grade hearing assessment with frequency-specific analysis - Serial output only
+ * @note        For MAX78000 EV Kit - Full frequency analysis with audiogram-style assessment
+ */
+
+/******************************************************************************
+ *
+ * Copyright (C) 2022-2023 Maxim Integrated Products, Inc. (now owned by 
+ * Analog Devices, Inc.),
+ * Copyright (C) 2023-2024 Analog Devices, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ ******************************************************************************/
+
+/***** Includes *****/
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+#include <stdarg.h>
+#include <float.h>  // For NaN and infinity checks
+
+#include "board.h"
+#include "icc.h"
+#include "i2s.h"
+#include "led.h"
+#include "mxc_delay.h"
+#include "mxc_device.h"
+#include "mxc_sys.h"
+#include "nvic_table.h"
+
+// NaN and infinity checking macros (if not available in math.h)
+#ifndef isnan
+#define isnan(x) ((x) != (x))
+#endif
+
+#ifndef isinf  
+#define isinf(x) (((x) == HUGE_VAL) || ((x) == -HUGE_VAL))
+#endif
+
+// Mathematical constants
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#ifdef BOARD_FTHR_REVA
+#include "max20303.h"
+#endif
+
+#define I2S_RX_BUFFER_SIZE 256
+#define FFT_SIZE 512                    // FFT size for frequency analysis
+#define ANALYSIS_WINDOW_SIZE FFT_SIZE   // Analyze every FFT_SIZE samples
+#define SAMPLE_RATE 16000
+
+// SPL calculation constants
+#define DIGITAL_FULL_SCALE 262144  // 18-bit signed max value (2^18 / 2)
+#define SPL_REFERENCE_DB 120.0f     // Reference SPL for calibration (adjust based on your mic)
+
+// Frequency analysis constants
+#define NUM_FREQ_BANDS 8           // Number of frequency bands to analyze
+#define MIN_FREQ 125               // Minimum frequency of interest (Hz)
+#define MAX_FREQ 8000              // Maximum frequency of interest (Hz)
+
+// Critical frequency bands for hearing damage (based on research)
+#define CRITICAL_FREQ_START 3000   // Start of critical frequency range
+#define CRITICAL_FREQ_END 6000     // End of critical frequency range
+
+// Dose calculation constants - Modified for 1-minute test
+#define TEST_DURATION_SEC 300       // 1 minute test instead of full day
+#define DOSE_WINDOW_SIZE_SEC 4     // Calculate dose every 4 seconds (longer for FFT stability)
+#define SAMPLES_PER_SEC (SAMPLE_RATE / ANALYSIS_WINDOW_SIZE)  // ~31 analyses per second
+#define DOSE_WINDOW_SAMPLES (DOSE_WINDOW_SIZE_SEC * SAMPLES_PER_SEC)  // ~124 measurements per dose window
+#define MAX_DOSE_WINDOWS (TEST_DURATION_SEC / DOSE_WINDOW_SIZE_SEC)   // 15 dose windows in 1 minute
+
+// Hearing Health Score constants (Garmin-style scoring)
+#define PERFECT_SCORE 100.0f       // Perfect hearing health score
+#define MINIMUM_SCORE 0.0f         // Worst possible score
+
+// FFT and frequency analysis structures
+typedef struct {
+    float real;
+    float imag;
+} complex_t;
+
+typedef struct {
+    float center_freq;     // Center frequency of the band
+    float lower_freq;      // Lower bound
+    float upper_freq;      // Upper bound
+    float energy;          // Energy in this band
+    float spl_db;          // SPL in dB for this band
+    float weight_factor;   // Weighting factor for hearing damage
+} freq_band_t;
+
+int32_t i2s_rx_buffer[I2S_RX_BUFFER_SIZE];
+
+/***** Global Data *****/
+volatile uint8_t i2s_flag = 0;
+uint8_t recv_data = 0;
+
+// FFT and frequency analysis buffers
+complex_t fft_buffer[FFT_SIZE];
+float fft_window[FFT_SIZE];           // Hanning window for FFT
+float fft_magnitude[FFT_SIZE / 2];    // Magnitude spectrum
+freq_band_t freq_bands[NUM_FREQ_BANDS]; // Frequency band analysis
+
+// Audio sample collection
+int32_t audio_samples[FFT_SIZE];
+uint32_t sample_index = 0;
+
+// Dose calculation variables
+float dose_window_freq_exposure[NUM_FREQ_BANDS]; // Frequency-specific exposure per window
+uint32_t dose_window_count = 0;        // Number of FFT analyses in current dose window
+float total_dose_exposure = 0.0f;      // Running total of dose exposure (0-100+%)
+float hearing_health_score = PERFECT_SCORE; // Current hearing health score (100=perfect, 0=worst)
+uint32_t dose_window_index = 0;        // Current dose window number
+float dose_history[MAX_DOSE_WINDOWS];  // History of dose values for each window
+uint32_t test_start_time = 0;          // Test start time
+uint8_t test_active = 0;               // Test status flag
+
+// Frequency-specific tracking
+float critical_freq_exposure = 0.0f;   // Exposure in critical frequency range (3-6 kHz)
+float low_freq_exposure = 0.0f;        // Low frequency exposure
+float high_freq_exposure = 0.0f;       // High frequency exposure
+
+void i2s_isr(void)
+{
+    i2s_flag = 1;
+    /* Clear I2S interrupt flag */
+    MXC_I2S_ClearFlags(MXC_F_I2S_INTFL_RX_THD_CH0);
+}
+
+/**
+ * @brief Initialize Hanning window for FFT
+ */
+void init_fft_window(void)
+{
+    for (int i = 0; i < FFT_SIZE; i++) {
+        fft_window[i] = 0.5f - 0.5f * cosf(2.0f * M_PI * i / (FFT_SIZE - 1));
+    }
+}
+
+/**
+ * @brief Simple FFT implementation (Cooley-Tukey radix-2)
+ */
+void fft(complex_t* x, int N)
+{
+    // Bit-reversal permutation
+    int j = 0;
+    for (int i = 1; i < N; i++) {
+        int bit = N >> 1;
+        while (j & bit) {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        
+        if (i < j) {
+            complex_t temp = x[i];
+            x[i] = x[j];
+            x[j] = temp;
+        }
+    }
+    
+    // FFT computation
+    for (int len = 2; len <= N; len <<= 1) {
+        float angle = -2.0f * M_PI / len;
+        complex_t wlen = {cosf(angle), sinf(angle)};
+        
+        for (int i = 0; i < N; i += len) {
+            complex_t w = {1.0f, 0.0f};
+            for (int j = 0; j < len / 2; j++) {
+                complex_t u = x[i + j];
+                complex_t v = {
+                    x[i + j + len/2].real * w.real - x[i + j + len/2].imag * w.imag,
+                    x[i + j + len/2].real * w.imag + x[i + j + len/2].imag * w.real
+                };
+                
+                x[i + j].real = u.real + v.real;
+                x[i + j].imag = u.imag + v.imag;
+                x[i + j + len/2].real = u.real - v.real;
+                x[i + j + len/2].imag = u.imag - v.imag;
+                
+                float w_temp = w.real * wlen.real - w.imag * wlen.imag;
+                w.imag = w.real * wlen.imag + w.imag * wlen.real;
+                w.real = w_temp;
+            }
+        }
+    }
+}
+
+/**
+ * @brief Initialize frequency bands for analysis
+ */
+void init_frequency_bands(void)
+{
+    // Define frequency bands based on audiometric standards and hearing damage research
+    // Focus on octave bands with emphasis on critical frequencies
+    
+    freq_bands[0] = (freq_band_t){250, 177, 354, 0, 0, 0.5f};    // Low frequency
+    freq_bands[1] = (freq_band_t){500, 354, 707, 0, 0, 0.7f};    // Low-mid frequency
+    freq_bands[2] = (freq_band_t){1000, 707, 1414, 0, 0, 1.0f};  // Mid frequency
+    freq_bands[3] = (freq_band_t){2000, 1414, 2828, 0, 0, 1.5f}; // Important for speech
+    freq_bands[4] = (freq_band_t){3000, 2828, 4243, 0, 0, 3.0f}; // CRITICAL: First damage
+    freq_bands[5] = (freq_band_t){4000, 3536, 5657, 0, 0, 3.5f}; // CRITICAL: Peak damage  
+    freq_bands[6] = (freq_band_t){6000, 5657, 8485, 0, 0, 2.5f}; // CRITICAL: Speech clarity
+    freq_bands[7] = (freq_band_t){8000, 7071, 8000, 0, 0, 1.0f}; // High frequency
+    
+    printf("Frequency bands initialized:\n");
+    printf("Critical range: 3-6 kHz\n");
+    printf("Peak damage freq: 4 kHz\n");
+}
+
+/**
+ * @brief Perform FFT analysis and extract frequency band information with validation
+ */
+void perform_fft_analysis(int32_t* samples)
+{
+    // Copy samples to FFT buffer and apply window
+    for (int i = 0; i < FFT_SIZE; i++) {
+        fft_buffer[i].real = (float)samples[i] * fft_window[i];
+        fft_buffer[i].imag = 0.0f;
+    }
+    
+    // Perform FFT
+    fft(fft_buffer, FFT_SIZE);
+    
+    // Calculate magnitude spectrum with validation
+    for (int i = 0; i < FFT_SIZE / 2; i++) {
+        float magnitude = sqrtf(fft_buffer[i].real * fft_buffer[i].real + 
+                               fft_buffer[i].imag * fft_buffer[i].imag);
+        
+        // Prevent NaN and ensure minimum value for log calculations
+        if (isnan(magnitude) || isinf(magnitude) || magnitude < 1e-10f) {
+            magnitude = 1e-10f;
+        }
+        
+        fft_magnitude[i] = magnitude;
+    }
+    
+    // Analyze frequency bands
+    float freq_resolution = (float)SAMPLE_RATE / FFT_SIZE;
+    
+    for (int band = 0; band < NUM_FREQ_BANDS; band++) {
+        int start_bin = (int)(freq_bands[band].lower_freq / freq_resolution);
+        int end_bin = (int)(freq_bands[band].upper_freq / freq_resolution);
+        
+        // Ensure bins are within valid range
+        if (start_bin < 0) start_bin = 0;
+        if (end_bin >= FFT_SIZE / 2) end_bin = FFT_SIZE / 2 - 1;
+        if (start_bin > end_bin) start_bin = end_bin;
+        
+        // Calculate energy in this frequency band
+        float band_energy = 0.0f;
+        int bin_count = 0;
+        
+        for (int bin = start_bin; bin <= end_bin; bin++) {
+            band_energy += fft_magnitude[bin] * fft_magnitude[bin];
+            bin_count++;
+        }
+        
+        if (bin_count > 0) {
+            band_energy /= bin_count;  // Average energy
+        } else {
+            band_energy = 1e-20f;  // Minimum energy if no bins
+        }
+        
+        // Ensure positive energy
+        if (band_energy <= 0.0f || isnan(band_energy) || isinf(band_energy)) {
+            band_energy = 1e-20f;
+        }
+        
+        freq_bands[band].energy = band_energy;
+        
+        // Convert to SPL with proper validation
+        float rms = sqrtf(band_energy);
+        if (rms > 0.0f && !isnan(rms) && !isinf(rms)) {
+            float db_fs = 20.0f * log10f(rms / DIGITAL_FULL_SCALE);
+            freq_bands[band].spl_db = SPL_REFERENCE_DB + db_fs;
+            
+            // Clamp SPL to reasonable bounds
+            if (freq_bands[band].spl_db < -90.0f) freq_bands[band].spl_db = -90.0f;
+            if (freq_bands[band].spl_db > 140.0f) freq_bands[band].spl_db = 140.0f;
+        } else {
+            freq_bands[band].spl_db = -90.0f;  // Very quiet
+        }
+        
+        // Final validation
+        if (isnan(freq_bands[band].spl_db) || isinf(freq_bands[band].spl_db)) {
+            freq_bands[band].spl_db = -90.0f;
+        }
+    }
+}
+
+/**
+ * @brief Calculate frequency-weighted hearing health score with NaN protection
+ */
+float calculate_frequency_weighted_score(void)
+{
+    float total_weighted_exposure = 0.0f;
+    float total_weight = 0.0f;
+    float valid_band_count = 0.0f;
+    
+    // Calculate weighted exposure across all frequency bands
+    for (int band = 0; band < NUM_FREQ_BANDS; band++) {
+        // Check for valid SPL values and avoid NaN
+        if (freq_bands[band].spl_db > -90.0f && freq_bands[band].spl_db < 150.0f) {
+            // Use a simpler, more stable calculation
+            float band_level = freq_bands[band].spl_db;
+            
+            // Apply frequency-specific weighting directly to dB values
+            float weighted_level = band_level * freq_bands[band].weight_factor;
+            
+            total_weighted_exposure += weighted_level;
+            total_weight += freq_bands[band].weight_factor;
+            valid_band_count += 1.0f;
+        }
+    }
+    
+    // Calculate weighted average SPL with fallback protection
+    float equivalent_spl = 50.0f;  // Default safe value
+    
+    if (total_weight > 0.0f && valid_band_count > 0.0f) {
+        equivalent_spl = total_weighted_exposure / total_weight;
+        
+        // Clamp to reasonable bounds
+        if (equivalent_spl < 30.0f) equivalent_spl = 30.0f;
+        if (equivalent_spl > 120.0f) equivalent_spl = 120.0f;
+    }
+    
+    return equivalent_spl;
+}
+
+/**
+ * @brief Calculate safe time allowed with NaN protection
+ */
+float calculate_safe_time(float equivalent_spl_dba)
+{
+    // Validate input and provide bounds
+    if (equivalent_spl_dba < 30.0f || equivalent_spl_dba > 120.0f || 
+        isnan(equivalent_spl_dba) || isinf(equivalent_spl_dba)) {
+        equivalent_spl_dba = 60.0f;  // Default safe assumption
+    }
+    
+    // Implement the formula: T_allowed = 86400 * 2^((70-L)/3)
+    float exponent = (70.0f - equivalent_spl_dba) / 3.0f;
+    
+    // Limit exponent to prevent overflow
+    if (exponent > 20.0f) exponent = 20.0f;
+    if (exponent < -20.0f) exponent = -20.0f;
+    
+    float safe_time_seconds = 86400.0f * powf(2.0f, exponent);
+    
+    // Ensure reasonable bounds
+    if (safe_time_seconds < 1.0f || isnan(safe_time_seconds) || isinf(safe_time_seconds)) {
+        safe_time_seconds = 1.0f;
+    }
+    if (safe_time_seconds > 86400.0f) {
+        safe_time_seconds = 86400.0f;
+    }
+    
+    return safe_time_seconds;
+}
+
+/**
+ * @brief Calculate dose with frequency-specific analysis and NaN protection
+ */
+float calculate_frequency_dose(float window_time_sec)
+{
+    float equivalent_spl = calculate_frequency_weighted_score();
+    float safe_time = calculate_safe_time(equivalent_spl);
+    
+    // Validate inputs
+    if (window_time_sec <= 0.0f || safe_time <= 0.0f) {
+        return 0.0f;  // No dose if invalid inputs
+    }
+    
+    float dose = (window_time_sec / safe_time) * 100.0f;
+    
+    // Ensure dose is not NaN or infinite
+    if (isnan(dose) || isinf(dose) || dose < 0.0f) {
+        dose = 0.0f;
+    }
+    
+    // Reasonable upper bound for dose per window
+    if (dose > 50.0f) {
+        dose = 50.0f;  // Cap individual window dose
+    }
+    
+    return dose;
+}
+
+/**
+ * @brief Analyze critical frequency exposure
+ */
+void analyze_critical_frequencies(void)
+{
+    critical_freq_exposure = 0.0f;
+    low_freq_exposure = 0.0f;
+    high_freq_exposure = 0.0f;
+    
+    for (int band = 0; band < NUM_FREQ_BANDS; band++) {
+        float band_center = freq_bands[band].center_freq;
+        float exposure = freq_bands[band].spl_db;
+        
+        if (band_center >= CRITICAL_FREQ_START && band_center <= CRITICAL_FREQ_END) {
+            critical_freq_exposure += exposure * freq_bands[band].weight_factor;
+        } else if (band_center < 1000) {
+            low_freq_exposure += exposure;
+        } else if (band_center > 6000) {
+            high_freq_exposure += exposure;
+        }
+    }
+    
+    // Normalize by number of bands in each category
+    critical_freq_exposure /= 3.0f;  // 3 critical bands (3k, 4k, 6k)
+    low_freq_exposure /= 2.0f;       // 2 low bands
+    high_freq_exposure /= 1.0f;      // 1 high band
+}
+
+/**
+ * @brief Process completed dose window with frequency analysis and NaN protection
+ */
+void process_dose_window(void)
+{
+    if (dose_window_count == 0) return;
+    
+    // Calculate frequency-weighted dose for this window
+    float window_dose = calculate_frequency_dose(DOSE_WINDOW_SIZE_SEC);
+    
+    // Validate window dose
+    if (isnan(window_dose) || isinf(window_dose) || window_dose < 0.0f) {
+        window_dose = 0.0f;  // Default to no dose if calculation failed
+        printf("Warning: Dose calculation error, using 0\n");
+    }
+    
+    // Store in history
+    if (dose_window_index < MAX_DOSE_WINDOWS) {
+        dose_history[dose_window_index] = window_dose;
+    }
+    
+    // Add to total dose exposure with validation
+    if (!isnan(window_dose) && !isinf(window_dose)) {
+        total_dose_exposure += window_dose;
+    }
+    
+    // Validate total exposure
+    if (isnan(total_dose_exposure) || isinf(total_dose_exposure) || total_dose_exposure < 0.0f) {
+        total_dose_exposure = 0.0f;
+    }
+    
+    // Calculate hearing health score (Garmin-style: higher = better)
+    hearing_health_score = PERFECT_SCORE - total_dose_exposure;
+    if (hearing_health_score < MINIMUM_SCORE || isnan(hearing_health_score)) {
+        hearing_health_score = MINIMUM_SCORE;
+    }
+    if (hearing_health_score > PERFECT_SCORE) {
+        hearing_health_score = PERFECT_SCORE;
+    }
+    
+    // Analyze critical frequencies
+    analyze_critical_frequencies();
+    
+    // Get equivalent SPL for display
+    float equivalent_spl = calculate_frequency_weighted_score();
+    float safe_time = calculate_safe_time(equivalent_spl);
+    
+    // Display comprehensive results with validation
+    printf("=== Window %d FFT Analysis ===\n", dose_window_index + 1);
+    printf("Equiv SPL: %.1f dBA\n", equivalent_spl);
+    printf("Critical (3-6k): %.1f dB\n", critical_freq_exposure);
+    printf("Low freq: %.1f dB\n", low_freq_exposure);  
+    printf("High freq: %.1f dB\n", high_freq_exposure);
+    printf("Safe Time: %.1f sec\n", safe_time);
+    printf("Window Dose: %.3f%%\n", window_dose);
+    printf("Total Dose: %.3f%%\n", total_dose_exposure);
+    printf("Health Score: %.1f/100\n", hearing_health_score);
+    
+    // Provide frequency-specific assessment
+    if (critical_freq_exposure > 85.0f) {
+        printf("WARNING: High critical freq!\n");
+    } else if (critical_freq_exposure > 70.0f) {
+        printf("CAUTION: Elevated 3-6kHz\n");
+    } else {
+        printf("Critical freq: OK\n");
+    }
+    
+    // Overall status
+    if (hearing_health_score >= 90.0f) {
+        printf("Status: EXCELLENT\n");
+    } else if (hearing_health_score >= 75.0f) {
+        printf("Status: GOOD\n");
+    } else if (hearing_health_score >= 50.0f) {
+        printf("Status: FAIR\n");  
+    } else if (hearing_health_score >= 25.0f) {
+        printf("Status: POOR\n");
+    } else {
+        printf("Status: CRITICAL\n");
+    }
+    
+    // Calculate elapsed time
+    uint32_t elapsed_sec = (dose_window_index + 1) * DOSE_WINDOW_SIZE_SEC;
+    printf("Elapsed: %d/%d sec\n", elapsed_sec, TEST_DURATION_SEC);
+    printf("-------------------\n");
+    
+    // Move to next dose window
+    dose_window_index++;
+    memset(dose_window_freq_exposure, 0, sizeof(dose_window_freq_exposure));
+    dose_window_count = 0;
+    
+    // Check if test is complete
+    if (dose_window_index >= MAX_DOSE_WINDOWS) {
+        printf("=== FFT TEST COMPLETE ===\n");
+        printf("Final Exposure: %.3f%%\n", total_dose_exposure);
+        printf("HEARING HEALTH SCORE: %.1f/100\n", hearing_health_score);
+        printf("Final Critical Freq: %.1f dB\n", critical_freq_exposure);
+        
+        // Final frequency-specific assessment
+        if (critical_freq_exposure > 85.0f) {
+            printf("CRITICAL FREQ RISK: HIGH\n");
+        } else if (critical_freq_exposure > 70.0f) {
+            printf("CRITICAL FREQ RISK: MODERATE\n");
+        } else {
+            printf("CRITICAL FREQ RISK: LOW\n");
+        }
+        
+        // Overall result with validation
+        if (isnan(hearing_health_score)) {
+            printf("RESULT: ERROR - Invalid calculation\n");
+        } else if (hearing_health_score >= 90.0f) {
+            printf("RESULT: EXCELLENT\n");
+            printf("All frequencies protected!\n");
+        } else if (hearing_health_score >= 75.0f) {
+            printf("RESULT: GOOD\n");
+            printf("Good frequency balance\n");
+        } else if (hearing_health_score >= 50.0f) {
+            printf("RESULT: FAIR\n");
+            printf("Watch critical frequencies\n");
+        } else if (hearing_health_score >= 25.0f) {
+            printf("RESULT: POOR\n");
+            printf("Protect 3-6 kHz range!\n");
+        } else {
+            printf("RESULT: CRITICAL\n");
+            printf("DANGER: Critical freq damage!\n");
+        }
+        
+        test_active = 0;
+    }
+}
+
+/**
+ * @brief Perform comprehensive FFT-based audio analysis with debugging
+ */
+void perform_fft_based_analysis(void)
+{
+    // Check for valid audio samples
+    float sample_sum = 0.0f;
+    int non_zero_count = 0;
+    
+    for (int i = 0; i < FFT_SIZE; i++) {
+        sample_sum += abs(audio_samples[i]);
+        if (audio_samples[i] != 0) non_zero_count++;
+    }
+    
+    // Debug audio input quality
+    static uint32_t debug_counter = 0;
+    debug_counter++;
+    
+    if (debug_counter % 8 == 0) {  // Debug every 8th analysis
+        printf("Audio Debug:\n");
+        printf("Non-zero samples: %d/%d\n", non_zero_count, FFT_SIZE);
+        printf("Avg amplitude: %.1f\n", sample_sum / FFT_SIZE);
+    }
+    
+    // Only proceed if we have reasonable audio data
+    if (non_zero_count > FFT_SIZE / 4) {  // At least 25% non-zero samples
+        // Perform FFT analysis on collected samples
+        perform_fft_analysis(audio_samples);
+        
+        // Add to current dose window
+        dose_window_count++;
+        
+        // Check if dose window is complete
+        if (dose_window_count >= DOSE_WINDOW_SAMPLES) {
+            process_dose_window();
+        }
+        
+        // Print detailed frequency analysis every ~8 seconds (every 4 FFT analyses)
+        static uint32_t print_counter = 0;
+        print_counter++;
+        
+        if (print_counter >= 4) {
+            float equivalent_spl = calculate_frequency_weighted_score();
+            analyze_critical_frequencies();
+            
+            printf("FFT Analysis:\n");
+            printf("Equiv SPL: %.1f dBA\n", equivalent_spl);
+            printf("Critical (3-6k): %.1f dB\n", critical_freq_exposure);
+            printf("4kHz SPL: %.1f dB\n", freq_bands[5].spl_db);  // 4kHz band
+            printf("Window: %d/%d\n", dose_window_count, DOSE_WINDOW_SAMPLES);
+            print_counter = 0;
+        }
+    } else {
+        printf("Warning: Low audio activity\n");
+        printf("Check microphone connection\n");
+    }
+}
+
+/**
+ * @brief Initialize dose calculation system
+ */
+void init_dose_system(void)
+{
+    // Reset all dose variables
+    memset(dose_window_freq_exposure, 0, sizeof(dose_window_freq_exposure));
+    dose_window_count = 0;
+    total_dose_exposure = 0.0f;
+    hearing_health_score = PERFECT_SCORE;
+    dose_window_index = 0;
+    test_active = 1;
+    
+    // Reset frequency tracking
+    critical_freq_exposure = 0.0f;
+    low_freq_exposure = 0.0f;
+    high_freq_exposure = 0.0f;
+    
+    // Clear dose history
+    memset(dose_history, 0, sizeof(dose_history));
+    
+    printf("=== CALIBRATION TEST ===\n");
+    printf("SPL Reference: %.0f dB\n", SPL_REFERENCE_DB);
+    printf("Test your environment:\n");
+    printf("- Quiet room: ~40-50 dB expected\n"); 
+    printf("- Normal conversation: ~65 dB expected\n");
+    printf("- Loud music: ~85+ dB expected\n");
+    printf("Compare with phone app or meter\n");
+    printf("Adjust SPL_REFERENCE_DB if needed\n");
+    printf("=== FFT HEARING ANALYSIS ===\n");
+    printf("Research-grade frequency analysis\n");
+    printf("Test Duration: %d seconds\n", TEST_DURATION_SEC);
+    printf("Window Size: %d seconds\n", DOSE_WINDOW_SIZE_SEC);
+    printf("FFT Size: %d samples\n", FFT_SIZE);
+    printf("Frequency Resolution: %.1f Hz\n", (float)SAMPLE_RATE / FFT_SIZE);
+    printf("Starting Score: %.0f/100\n", hearing_health_score);
+    printf("Monitoring all frequencies...\n");
+}
+
+/*****************************************************************/
+int main(void)
+{
+    int32_t err;
+    mxc_i2s_req_t req;
+    uint32_t rx_size;
+    int32_t *buf_current, *buf_start, *buf_end;
+
+    /* Enable cache */
+    MXC_ICC_Enable(MXC_ICC0);
+
+    /* Set system clock to 100 MHz */
+    MXC_SYS_Clock_Select(MXC_SYS_CLOCK_IPO);
+    SystemCoreClockUpdate();
+
+    printf("\n***** I2S FFT-Based Hearing Health Monitor *****\n");
+    printf("MAX78000 EV Kit - Research-Grade Frequency Analysis\n");
+    printf("Serial Output Only - No TFT Display\n");
+
+    /* Initialize FFT components */
+    init_fft_window();
+    init_frequency_bands();
+    
+    /* Initialize microphone (if using Featherboard) */
+#ifdef BOARD_FTHR_REVA
+    printf("Init PMIC...\n");
+    if (max20303_init(MXC_I2C1) != E_NO_ERROR) {
+        printf("PMIC init FAILED!\n");
+        while (1) {}
+    }
+
+    if (max20303_mic_power(1) != E_NO_ERROR) {
+        printf("Mic power FAILED!\n");
+        while (1) {}
+    }
+
+    MXC_Delay(MXC_DELAY_MSEC(200));
+    printf("Microphone enabled\n");
+#else
+    printf("Using EV Kit microphone\n");
+#endif
+
+    /* Initialize I2S RX buffer */
+    memset(i2s_rx_buffer, 0, sizeof(i2s_rx_buffer));
+    memset(audio_samples, 0, sizeof(audio_samples));
+    sample_index = 0;
+    
+    /* Initialize dose calculation system */
+    init_dose_system();
+    
+    printf("I2S Configuration...\n");
+
+    /* Configure I2S interface parameters */
+    req.wordSize = MXC_I2S_WSIZE_WORD;
+    req.sampleSize = MXC_I2S_SAMPLESIZE_THIRTYTWO;
+    req.bitsWord = 32;
+    req.adjust = MXC_I2S_ADJUST_LEFT;
+    req.justify = MXC_I2S_MSB_JUSTIFY;
+    req.wsPolarity = MXC_I2S_POL_NORMAL;
+    req.channelMode = MXC_I2S_INTERNAL_SCK_WS_0;
+    req.stereoMode = MXC_I2S_MONO_LEFT_CH;
+    req.bitOrder = MXC_I2S_MSB_FIRST;
+    req.clkdiv = 5;
+    req.rawData = NULL;
+    req.txData = NULL;
+    req.rxData = i2s_rx_buffer;
+    req.length = I2S_RX_BUFFER_SIZE;
+
+    if ((err = MXC_I2S_Init(&req)) != E_NO_ERROR) {
+        printf("I2S Init Error: %d\n", err);
+        while (1) {}
+    }
+
+    printf("I2S Init Success\n");
+
+    /* Set I2S RX FIFO threshold to generate interrupt */
+    MXC_I2S_SetRXThreshold(4);
+    MXC_NVIC_SetVector(I2S_IRQn, i2s_isr);
+    NVIC_EnableIRQ(I2S_IRQn);
+    MXC_I2S_EnableInt(MXC_F_I2S_INTEN_RX_THD_CH0);
+    MXC_I2S_RXEnable();
+
+    buf_start = &i2s_rx_buffer[0];
+    buf_end = &i2s_rx_buffer[I2S_RX_BUFFER_SIZE - 1];
+    buf_current = buf_start;
+
+    printf("FFT analysis started\n");
+    printf("Collecting frequency data...\n");
+
+    while (test_active) {
+        /* Wait for I2S interrupt */
+        while (i2s_flag == 0) {}
+
+        /* Clear flag */
+        i2s_flag = 0;
+        /* Read number of samples in I2S RX FIFO */
+        rx_size = MXC_I2S->dmach0 >> MXC_F_I2S_DMACH0_RX_LVL_POS;
+
+        while (rx_size--) {
+            /* Copy captured microphone sample into i2s_rx_buffer */
+            int32_t sample = ((int32_t)MXC_I2S->fifoch0) >> 14;
+            *buf_current++ = sample;
+
+            if (buf_current > buf_end) {
+                buf_current = buf_start;
+            }
+            
+            /* Collect samples for FFT analysis */
+            audio_samples[sample_index] = sample;
+            sample_index++;
+            
+            /* Perform FFT analysis when buffer is full */
+            if (sample_index >= FFT_SIZE) {
+                perform_fft_based_analysis();
+                sample_index = 0;  // Reset for next FFT window
+            }
+        }
+
+        if (!recv_data && *(buf_current - 1) != 0) {
+            printf("Audio data detected!\n");
+            printf("FFT analysis active\n");
+            recv_data = 1;
+        }
+    }
+
+    /* Test complete - display final summary with validation */
+    printf("=== FINAL FFT SUMMARY ===\n");
+    printf("Test completed successfully\n");
+    printf("Duration: %d seconds\n", TEST_DURATION_SEC);
+    
+    // Validate final values before display
+    if (isnan(total_dose_exposure) || isinf(total_dose_exposure)) {
+        total_dose_exposure = 0.0f;
+        printf("Note: Dose calculation error occurred\n");
+    }
+    
+    if (isnan(hearing_health_score) || isinf(hearing_health_score)) {
+        hearing_health_score = 100.0f;  // Default to perfect if calculation failed
+        printf("Note: Score calculation error occurred\n");
+    }
+    
+    printf("Total Exposure: %.3f%%\n", total_dose_exposure);
+    printf("HEARING HEALTH SCORE: %.1f/100\n", hearing_health_score);
+    printf("Critical Freq Final: %.1f dB\n", critical_freq_exposure);
+    
+    // Provide final frequency-specific recommendations
+    if (isnan(critical_freq_exposure) || critical_freq_exposure < 0.0f) {
+        printf("Rec: Unable to assess frequency balance\n");
+    } else if (critical_freq_exposure > 85.0f) {
+        printf("Rec: Protect 3-6 kHz range!\n");
+    } else if (critical_freq_exposure > 70.0f) {
+        printf("Rec: Monitor speech frequencies\n");
+    } else {
+        printf("Rec: Excellent frequency balance!\n");
+    }
+    
+    // Keep running to display results
+    while (1) {
+        MXC_Delay(MXC_DELAY_SEC(1));
+    }
+
+    return 0;
+}
